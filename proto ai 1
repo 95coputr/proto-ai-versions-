@@ -1,0 +1,625 @@
+import concurrent.futures
+import json
+import re
+import ssl
+import textwrap
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+math_history = []
+yt_mode_always_on = False
+deep_think_enabled = True
+
+TRUSTED_SITES = [
+    "wikipedia.org",
+    "britannica.com",
+    "gov",
+    "edu",
+    "bbc.com",
+    "reuters.com",
+    "nasa.gov",
+    "nytimes.com",
+]
+
+
+def clean_text(raw_html):
+    clean = re.sub(r"<[^>]+>", "", raw_html)
+    clean = (
+        clean.replace("&quot;", '"')
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+    )
+    return re.sub(r"\s+", " ", clean).strip()
+
+
+def extract_math_expression(text):
+    text_clean = text.lower()
+    text_clean = (
+        text_clean.replace("times", "*")
+        .replace("x", "*")
+        .replace("divided by", "/")
+    )
+    text_clean = text_clean.replace("plus", "+").replace("minus", "-")
+
+    match = re.search(
+        r"(\d+(?:\.\d+)?\s*[\+\-\*/]\s*\d+(?:\.\d+)?(?:\s*[\+\-\*/]\s*\d+(?:\.\d+)?)*)",
+        text_clean,
+    )
+    if match:
+        return match.group(1)
+    return None
+
+
+def fetch_nyt_top_news():
+    url = "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            xml_data = resp.read().decode("utf-8")
+            root = ET.fromstring(xml_data)
+
+            items = root.findall("./channel/item")
+            if not items:
+                return "❌ Unable to parse New York Times news feed."
+
+            output = ["📰 NEW YORK TIMES - TOP 10 HEADLINES\n"]
+            for idx, item in enumerate(items[:10], 1):
+                title = clean_text(item.findtext("title", "No Title"))
+                desc = clean_text(item.findtext("description", "No Summary"))
+                link = clean_text(item.findtext("link", ""))
+
+                output.append(f"[{idx}] {title}")
+                if desc:
+                    output.append(f"    📝 {desc}")
+                if link:
+                    output.append(f"    🔗 Link: {link}")
+                output.append("")
+
+            return "\n".join(output).strip()
+    except Exception as e:
+        return f"❌ Error fetching New York Times news: {str(e)}"
+
+
+def fetch_wikipedia_info(query):
+    clean_query = re.sub(
+        r"^(what|who|where|when|why|how)\s+(is|are|was|were|the|a|an)\s+",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(clean_query)}"
+    try:
+        req = urllib.request.Request(wiki_url, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            extract = data.get("extract", "")
+            page_url = data.get("content_urls", {}).get("desktop", {}).get("page", "")
+
+            if extract and data.get("type") != "disambiguation":
+                sentences = re.split(r"(?<=[.!?])\s+", extract)
+                short_summary = " ".join(sentences[:3])
+                return {"summary": short_summary, "link": page_url}
+    except Exception:
+        pass
+
+    try:
+        search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query)}&format=json"
+        req_search = urllib.request.Request(search_url, headers=headers)
+        with urllib.request.urlopen(req_search, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            search_results = data.get("query", {}).get("search", [])
+            if search_results:
+                first_title = search_results[0]["title"]
+                snippet = clean_text(search_results[0].get("snippet", ""))
+                link = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(first_title)}"
+                return {"summary": snippet, "link": link}
+    except Exception:
+        pass
+
+    return None
+
+
+def fetch_wikipedia_vocabulary(term):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(term)}"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("type") == "disambiguation":
+                return None
+            title = data.get("title", term)
+            description = data.get("description", "Vocabulary / Concept")
+            extract = data.get("extract", "")
+            
+            if extract:
+                return {
+                    "title": title,
+                    "description": description,
+                    "meaning": extract
+                }
+    except Exception:
+        pass
+    return None
+
+
+def fetch_top_5_web_resources(query):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    results = []
+
+    try:
+        data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://html.duckduckgo.com/html/", data=data, headers=headers
+        )
+
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+
+            raw_snippets = re.findall(
+                r'<a class="result__snippet[^>]*>([\s\S]*?)</a>', html
+            )
+            raw_links = re.findall(
+                r'<a class="result__url[^>]*href="([^"]+)"', html
+            )
+
+            for i in range(min(5, len(raw_snippets))):
+                txt = clean_text(raw_snippets[i])
+                lnk = raw_links[i] if i < len(raw_links) else "N/A"
+                if lnk.startswith("//"):
+                    lnk = f"https:{lnk}"
+
+                is_trusted = any(domain in lnk.lower() for domain in TRUSTED_SITES)
+                trusted_badge = "🛡️ [TRUSTED SITE]" if is_trusted else "🌐 [WEB RESOURCE]"
+
+                if txt:
+                    results.append(
+                        {
+                            "rank": len(results) + 1,
+                            "snippet": txt,
+                            "link": lnk,
+                            "badge": trusted_badge,
+                        }
+                    )
+    except Exception:
+        pass
+
+    return results
+
+
+def fetch_youtube_videos(query):
+    search_url = f"https://youtube.com/results?search_query={urllib.parse.quote(query)}"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    try:
+        req = urllib.request.Request(search_url, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+            video_ids = re.findall(r"\"videoId\":\"([^\"]+)\"", html)
+
+            unique_ids = []
+            for vid in video_ids:
+                if vid not in unique_ids:
+                    unique_ids.append(vid)
+                if len(unique_ids) >= 3:
+                    break
+
+            if not unique_ids:
+                return None
+
+            video_links = [
+                f"• https://youtube.com/watch?v={vid}" for vid in unique_ids
+            ]
+            return (
+                f"📹 YOUTUBE VIDEO TUTORIALS / RESULTS FOR '{query}':\n"
+                + "\n".join(video_links)
+            )
+    except Exception:
+        return None
+
+
+def get_weather(location):
+    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(geo_url, headers={"User-Agent": "ProtoAI/2.0"})
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            geo_data = json.loads(resp.read().decode())
+            results = geo_data.get("results")
+            if not results:
+                return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+
+            lat = results[0]["latitude"]
+            lon = results[0]["longitude"]
+            city_name = results[0]["name"]
+            country = results[0].get("country", "")
+
+        weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_gusts_10m"
+        req_w = urllib.request.Request(weather_url, headers={"User-Agent": "ProtoAI/2.0"})
+        with urllib.request.urlopen(req_w, context=ctx) as resp_w:
+            w_data = json.loads(resp_w.read().decode())["current"]
+            return (
+                f"📍 {city_name}, {country}\n"
+                f"🌡️ Temp: {w_data['temperature_2m']}°C\n"
+                f"💧 Humidity: {w_data['relative_humidity_2m']}%\n"
+                f"💨 Wind Speed: {w_data['wind_speed_10m']} km/h\n"
+                f"🌪️ Wind Gusts: {w_data['wind_gusts_10m']} km/h"
+            )
+    except Exception:
+        return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+
+
+def get_time(location):
+    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(geo_url, headers={"User-Agent": "ProtoAI/2.0"})
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            geo_data = json.loads(resp.read().decode())
+            results = geo_data.get("results")
+            if not results:
+                return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+
+            timezone = results[0].get("timezone", "UTC")
+            city_name = results[0]["name"]
+
+        time_url = f"https://timeapi.io/api/Time/current/zone?timeZone={urllib.parse.quote(timezone)}"
+        req_t = urllib.request.Request(time_url, headers={"User-Agent": "ProtoAI/2.0"})
+        with urllib.request.urlopen(req_t, context=ctx) as resp_t:
+            t_data = json.loads(resp_t.read().decode())
+            return (
+                f"🕒 {city_name} Time\n"
+                f"📅 Date: {t_data.get('date')}\n"
+                f"⏰ Time: {t_data.get('time')} ({t_data.get('dayOfWeek')})\n"
+                f"🌐 Timezone: {timezone}"
+            )
+    except Exception:
+        return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+
+
+def get_crypto(coin):
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={urllib.parse.quote(coin.lower())}&vs_currencies=usd,eur"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ProtoAI/2.0"})
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
+            if coin.lower() in data and data[coin.lower()]:
+                usd = data[coin.lower()]["usd"]
+                eur = data[coin.lower()]["eur"]
+                return (
+                    f"🪙 {coin.upper()} Price\n"
+                    f"💵 USD: ${usd:,.2f}\n"
+                    f"💶 EUR: €{eur:,.2f}"
+                )
+            return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+    except Exception:
+        return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+
+
+def get_stock(ticker):
+    mapping = {
+        "apple": "AAPL",
+        "tesla": "TSLA",
+        "nvidia": "NVDA",
+        "microsoft": "MSFT",
+        "google": "GOOGL",
+    }
+    symbol = mapping.get(ticker.lower(), ticker.upper())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?range=1d&interval=1d"
+    headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)"}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
+            meta = data["chart"]["result"][0]["meta"]
+            symbol = meta["symbol"]
+            price = meta["regularMarketPrice"]
+            currency = meta.get("currency", "USD")
+            prev_close = meta.get("chartPreviousClose", price)
+            change = price - prev_close
+            pct = (change / prev_close) * 100 if prev_close else 0
+
+            return (
+                f"📈 Stock: {symbol}\n"
+                f"💵 Price: ${price:,.2f} {currency}\n"
+                f"📊 Change: {change:+.2f} ({pct:+.2f}%)"
+            )
+    except Exception:
+        return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+
+
+def deep_think_processor(query):
+    if not deep_think_enabled:
+        return
+
+    print("\n[🧠 PROTO DEEP THINKING ENGINE ACTIVATED]")
+    print(" ├─ Analyzing prompt intent & entity extraction...")
+    time.sleep(0.5)
+    print(" ├─ Routing: Wikipedia Vocab + Parallel Web Search")
+    time.sleep(0.5)
+    print(" ├─ Fetching multi-threaded endpoints...")
+    print(" └─ Synthesizing response parameters... DONE!\n")
+
+
+def dual_engine_explain(query):
+    global yt_mode_always_on
+
+    words = query.strip().split()
+
+    # IF THE USER ENTERS A SINGLE WORD/VOCABULARY TERM
+    if len(words) == 1 and not query.startswith("/"):
+        vocab = fetch_wikipedia_vocabulary(query)
+        if vocab:
+            return (
+                f"📖 WIKIPEDIA VOCABULARY ENGINE\n"
+                f"🔤 Term: {vocab['title']}\n"
+                f"🏷️ Type: {vocab['description']}\n"
+                f"📝 Meaning: {vocab['meaning']}"
+            )
+
+    # FOR MULTI-WORD QUERIES OR PHRASES
+    deep_think_processor(query)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        vocab_future = executor.submit(fetch_wikipedia_vocabulary, query)
+        wiki_future = executor.submit(fetch_wikipedia_info, query)
+        web_future = executor.submit(fetch_top_5_web_resources, query)
+
+        vocab_res = vocab_future.result()
+        wiki_res = wiki_future.result()
+        web_res = web_future.result()
+
+    if not wiki_res and not web_res and not vocab_res:
+        return "no search results found, sorry for being inconvenient proto ai dual engine 2.0 is still a beta"
+
+    output_lines = [f"🔍 PARALLEL SEARCH RESULTS FOR '{query}':\n"]
+
+    if vocab_res:
+        output_lines.append("📖 [WIKIPEDIA VOCABULARY DEFINITION]")
+        output_lines.append(f"🔤 Term: {vocab_res['title']}")
+        output_lines.append(f"📝 Meaning: {vocab_res['meaning']}\n")
+
+    if wiki_res:
+        output_lines.append("📚 [WIKIPEDIA OVERVIEW]")
+        output_lines.append(f'"{wiki_res["summary"]}"')
+        if wiki_res["link"]:
+            output_lines.append(f"🔗 Link: {wiki_res['link']}\n")
+
+    if web_res:
+        output_lines.append("🌐 [SEARCH RESULTS & TRUSTED WEBSITES]")
+        for res in web_res:
+            output_lines.append(
+                f"[{res['rank']}] {res['badge']} {res['snippet']}\n🔗 Link: {res['link']}\n"
+            )
+
+    if yt_mode_always_on:
+        yt_videos = fetch_youtube_videos(query)
+        if yt_videos:
+            output_lines.append(f"\n{yt_videos}")
+
+    return "\n".join(output_lines)
+
+
+print("PROTO AI DUAL ENGINE 2.0 READY")
+print("Type /help for command list.\n")
+
+for i in range(100):
+    try:
+        print(f"[{i+1}/100] Enter query or command:")
+        user_input = input().strip()
+
+        if not user_input:
+            continue
+
+        cmd = user_input.lower()
+
+        if cmd in ["/news", "news"]:
+            print("\n[FETCHING NYT HEADLINES...]")
+            nyt_data = fetch_nyt_top_news()
+            print("\n" + textwrap.fill(nyt_data, width=42, replace_whitespace=False, drop_whitespace=False))
+            print("-" * 30 + "\n")
+            continue
+
+        if cmd.startswith("/tmr "):
+            parts = user_input.split(" ")
+            if len(parts) >= 2 and parts[1].isdigit():
+                sec = int(parts[1])
+                print(f"\n[TIMER STARTED: {sec} SECONDS] ⏱️")
+
+                for remaining in range(sec, 0, -1):
+                    print(f"⏳ Time left: {remaining}s")
+                    time.sleep(1)
+
+                print("\n🚨 TIME'S UP! TIMER FINISHED! 🚨\n")
+                print("-" * 30 + "\n")
+                continue
+            else:
+                print("\nInvalid syntax! Usage: /tmr <seconds>\n")
+                continue
+
+        if cmd.startswith("/rp "):
+            parts = user_input.split(" ", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                repeat_count = int(parts[1])
+                text_to_repeat = parts[2] if len(parts) > 2 else "PROTO AI REPEAT"
+
+                print(f"\n[REPEATER ENGINE ACTIVATED: {repeat_count} TIMES] 🔁")
+                for r in range(repeat_count):
+                    print(f"({r+1}/{repeat_count}) {text_to_repeat}")
+                print("-" * 30 + "\n")
+                continue
+            else:
+                print("\nInvalid syntax! Usage: /rp <amount> <text to repeat>\n")
+                continue
+
+        math_expr = extract_math_expression(user_input)
+
+        if cmd in ["nah", "no", "nope", "nah.", "no.", "nope.", "exit", "quit"]:
+            print("\nProto AI session closed. Catch ya later! 😔✌️🥀\n")
+            break
+
+        elif cmd == "/dt true":
+            deep_think_enabled = True
+            print("\n[🧠 Deep Thinking Mode Enabled Globally] 🧠\n")
+            continue
+
+        elif cmd == "/dt false":
+            deep_think_enabled = False
+            print("\n[🧠 Deep Thinking Mode Disabled Globally] 🧠\n")
+            continue
+
+        elif cmd == "/yt true":
+            yt_mode_always_on = True
+            print("\n[YouTube Search Mode Enabled Globally] 📹\n")
+            continue
+
+        elif cmd == "/yt false":
+            yt_mode_always_on = False
+            print("\n[YouTube Search Mode Set to Fallback Only] 📹\n")
+            continue
+
+        elif cmd == "/help":
+            print("\n📌 PROTO COMMAND MENU:")
+            print("• /news (Top 10 New York Times Recent News)")
+            print("• /weather <city>")
+            print("• /time <city>")
+            print("• /stock <ticker/company>")
+            print("• /crypto <coin name>")
+            print("• /history")
+            print("• /tmr <seconds> (Runs live timer countdown)")
+            print("• /rp <amount> <text> (Repeats message X times)")
+            print("• /dt true / false (Enable/disable deep thinking delays)")
+            print("• /yt true (Force YouTube results always)")
+            print("• /yt false (YouTube results only when search fails)")
+            print("• hello / hi")
+            print("• <type a single word for instant definition/meaning>")
+            print("• <type any sentence to search Wikipedia + trusted sites>")
+            print("-" * 30 + "\n")
+
+        elif cmd.startswith("/weather ") or "weather in " in cmd:
+            city = cmd.replace("/weather ", "").replace("weather in ", "").strip()
+            w_report = get_weather(city)
+            print("\n[LIVE WEATHER TELEMETRY]")
+            print(textwrap.fill(w_report, width=42, replace_whitespace=False, drop_whitespace=False))
+            print("-" * 30 + "\n")
+
+        elif cmd.startswith("/time ") or "time in " in cmd:
+            city = cmd.replace("/time ", "").replace("time in ", "").strip()
+            t_report = get_time(city)
+            print("\n[CLOCK TELEMETRY]")
+            print(textwrap.fill(t_report, width=42, replace_whitespace=False, drop_whitespace=False))
+            print("-" * 30 + "\n")
+
+        elif cmd.startswith("/crypto "):
+            coin = cmd.replace("/crypto ", "").strip()
+            c_report = get_crypto(coin)
+            print("\n[CRYPTO TICKER]")
+            print(textwrap.fill(c_report, width=42, replace_whitespace=False, drop_whitespace=False))
+            print("-" * 30 + "\n")
+
+        elif cmd.startswith("/stock "):
+            ticker = cmd.replace("/stock ", "").strip()
+            s_report = get_stock(ticker)
+            print("\n[STOCK TICKER]")
+            print(textwrap.fill(s_report, width=42, replace_whitespace=False, drop_whitespace=False))
+            print("-" * 30 + "\n")
+
+        elif cmd == "/history":
+            print("\n[CALCULATION HISTORY]")
+            if not math_history:
+                print("No calculations recorded yet.")
+            else:
+                for entry in math_history[-5:]:
+                    print(f"• {entry}")
+            print("-" * 30 + "\n")
+
+        elif cmd in ["hello", "hi"]:
+            print("hi\n")
+
+        elif math_expr:
+            try:
+                result = eval(math_expr)
+                record = f"{math_expr} = {result}"
+                math_history.append(record)
+                print(f"Answer: {result}\n")
+            except Exception:
+                print("Invalid math equation!\n")
+
+        else:
+            ai_response = dual_engine_explain(user_input)
+            print("\n" + textwrap.fill(ai_response, width=42, replace_whitespace=False, drop_whitespace=False))
+
+            if "no search results found" not in ai_response:
+                print("\nAny other questions?\n")
+                follow_up = input().strip().lower()
+                if follow_up in ["nah", "no", "nope", "nah.", "no.", "nope.", "exit", "quit"]:
+                    print("\nProto AI session closed. Catch ya later! 😔✌️🥀\n")
+                    break
+
+            print("-" * 30 + "\n")
+
+    except EOFError:
+        print("\nSession ended.")
+        break
+    except Exception as e:
+        print(f"Error: {e}\n")
+
+print("100 request limit reached.")
